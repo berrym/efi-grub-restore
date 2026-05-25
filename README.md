@@ -1,5 +1,10 @@
 # efi-grub-restore
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/berrym/efi-grub-restore?label=release)](https://github.com/berrym/efi-grub-restore/releases/latest)
+[![Fedora 42+](https://img.shields.io/badge/Fedora-42%2B-294172?logo=fedora&logoColor=white)](https://fedoraproject.org/)
+[![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+
 Auto-restore `/boot/efi/EFI/fedora/grub.cfg` after Fedora package updates clobber it, on full-disk-encrypted Fedora installs where `/boot` lives **inside** the encrypted btrfs root and the EFI grub.cfg chains into a pinned btrfs snapshot.
 
 If a Fedora `grub2-efi-x64`, `shim-x64`, or related update overwrites your EFI grub.cfg with Fedora's default (no `cryptomount`, no snapshot prefix), GRUB drops to a rescue prompt on next boot and you can't unlock your root. This tool catches the overwrite and rewrites the correct 5-line config from values it derives at runtime, before that next boot.
