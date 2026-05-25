@@ -1,0 +1,7 @@
+# Re-render /boot/efi/EFI/fedora/grub.cfg after every dnf5/PackageKit
+# transaction, including offline updates run from system-update.target.
+# Idempotent — the script no-ops if the live file already matches.
+#
+# Format: <hook>:<pkg_filter>:<direction>:<options>:<command>
+# Empty pkg_filter means "fire on every transaction regardless of packages".
+post_transaction::::/usr/local/bin/restore-efi-grub

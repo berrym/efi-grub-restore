@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-render EFI grub.cfg at boot (catch anything missed during shutdown/update)
+RequiresMountsFor=/boot/efi
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-efi-grub
+
+[Install]
+WantedBy=multi-user.target

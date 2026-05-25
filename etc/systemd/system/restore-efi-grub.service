@@ -1,0 +1,7 @@
+[Unit]
+Description=Render and restore custom EFI grub.cfg
+RequiresMountsFor=/boot/efi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-efi-grub

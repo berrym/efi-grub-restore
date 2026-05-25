@@ -1,0 +1,149 @@
+#!/bin/bash
+# Render the desired /boot/efi/EFI/fedora/grub.cfg from runtime state
+# (LUKS UUID, btrfs FS UUID, btrfs default subvolume) and write it back
+# if the live file differs. Idempotent. No hardcoded identifiers — drop
+# this on any FDE Fedora install with /boot inside an encrypted btrfs.
+#
+# Fired by:
+#   - restore-efi-grub.path           (inotify on the live file, in-session)
+#   - libdnf5 actions plugin          (post_transaction, including offline)
+#   - restore-efi-grub-boot.service   (oneshot at boot, belt-and-suspenders)
+set -euo pipefail
+
+# system-update.target can ship a minimal PATH; be explicit.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+LIVE=/boot/efi/EFI/fedora/grub.cfg
+ALLOW_ONCE=/etc/grub-custom/.allow-once
+ARCHIVE_DIR=/var/log/restore-efi-grub
+TAG=restore-efi-grub
+
+DRY_RUN=0
+VERBOSE=0
+for arg in "$@"; do
+    case "$arg" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -v|--verbose) VERBOSE=1 ;;
+        -h|--help)
+            cat <<'USAGE'
+Usage: restore-efi-grub [--dry-run|-n] [--verbose|-v] [--help|-h]
+
+Derives LUKS UUID, btrfs FS UUID, and btrfs default subvolume from the
+running system, renders the desired /boot/efi/EFI/fedora/grub.cfg, and
+writes it back if the live file differs.
+
+  --dry-run   Print derived values, rendered config, and a diff against
+              the live file. Make no changes. Exit 0 even if drift exists.
+  --verbose   Print derived values to stderr even during a normal run.
+USAGE
+            exit 0
+            ;;
+        *) printf 'unknown argument: %s (try --help)\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+# In dry-run, suppress syslog noise; stay quiet on info, still log real errors.
+if [[ $DRY_RUN -eq 1 ]]; then
+    log()  { :; }
+    warn() { echo "warn: $*" >&2; }
+else
+    log()  { logger -t "$TAG" -p daemon.info    -- "$*"; }
+    warn() { logger -t "$TAG" -p daemon.warning -- "$*"; echo "warn: $*" >&2; }
+fi
+die() { logger -t "$TAG" -p daemon.err -- "$*" 2>/dev/null || true; echo "error: $*" >&2; exit 1; }
+
+# --- derive runtime values ---------------------------------------------------
+
+ROOT_SRC=$(findmnt -no SOURCE /) || die "cannot resolve root source"
+ROOT_DEV=${ROOT_SRC%%\[*}   # strip "[/subvol]" suffix if present
+
+LUKS_DEV=$(cryptsetup status "$ROOT_DEV" 2>/dev/null \
+    | awk '/^[[:space:]]*device:/ {print $2; exit}')
+[[ -n "${LUKS_DEV:-}" ]] || die "root $ROOT_DEV is not on a LUKS-mapped device"
+
+LUKS_UUID=$(cryptsetup luksUUID "$LUKS_DEV") \
+    || die "cannot read LUKS UUID from $LUKS_DEV"
+LUKS_UUID_RAW=${LUKS_UUID//-/}
+
+BTRFS_UUID=$(findmnt -no UUID /) || die "cannot resolve btrfs UUID for /"
+
+# Default subvolume path relative to fs top, e.g. ".snapshots/7636/snapshot"
+DEFAULT_SUBVOL=$(btrfs subvolume get-default / 2>/dev/null \
+    | sed -n 's/.*path \(.*\)$/\1/p')
+[[ -n "${DEFAULT_SUBVOL:-}" ]] || die "cannot resolve btrfs default subvolume"
+# Reject the degenerate "no default set" case (top-level)
+case "$DEFAULT_SUBVOL" in
+    "<FS_TREE>"|"(FS_TREE)") die "btrfs default is the top-level subvolume — set a default with 'btrfs subvolume set-default' first" ;;
+esac
+
+# --- render desired config ---------------------------------------------------
+
+DESIRED=$(cat <<EOF
+cryptomount -u $LUKS_UUID_RAW
+search --no-floppy --root-dev-only --fs-uuid --set=dev $BTRFS_UUID
+set prefix=(\$dev)/$DEFAULT_SUBVOL/boot/grub2
+export \$prefix
+configfile \$prefix/grub.cfg
+EOF
+)
+
+if [[ $VERBOSE -eq 1 || $DRY_RUN -eq 1 ]]; then
+    {
+        echo "--- derived values ---"
+        echo "ROOT_DEV       = $ROOT_DEV"
+        echo "LUKS_DEV       = $LUKS_DEV"
+        echo "LUKS_UUID_RAW  = $LUKS_UUID_RAW"
+        echo "BTRFS_UUID     = $BTRFS_UUID"
+        echo "DEFAULT_SUBVOL = $DEFAULT_SUBVOL"
+    } >&2
+fi
+
+# --- compare and act ---------------------------------------------------------
+
+[[ -d $(dirname "$LIVE") ]] || die "EFI dir $(dirname "$LIVE") missing — is the ESP mounted?"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "--- desired grub.cfg ---"
+    printf '%s\n' "$DESIRED"
+    echo "--- end desired ---"
+    echo
+    if [[ ! -f "$LIVE" ]]; then
+        echo "live $LIVE does not exist — would create it"
+        exit 0
+    fi
+    if [[ "$(cat "$LIVE")" == "$DESIRED" ]]; then
+        echo "live $LIVE already matches desired — no action needed"
+        exit 0
+    fi
+    echo "--- diff (live -> desired) ---"
+    diff -u "$LIVE" <(printf '%s\n' "$DESIRED") || true
+    echo "--- end diff ---"
+    echo "would write desired version (dry-run: no changes made)"
+    exit 0
+fi
+
+if [[ -f "$LIVE" ]] && [[ "$(cat "$LIVE")" == "$DESIRED" ]]; then
+    exit 0
+fi
+
+if [[ -f "$ALLOW_ONCE" ]]; then
+    rm -f "$ALLOW_ONCE"
+    log "allow-once present; left $LIVE untouched (run again to re-render)"
+    exit 0
+fi
+
+mkdir -p "$ARCHIVE_DIR"
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+if [[ -f "$LIVE" ]]; then
+    cp -a "$LIVE" "$ARCHIVE_DIR/grub.cfg.clobbered.$TS" || true
+fi
+
+# Write to a temp file in the same FAT directory and rename — survives crashes
+# better than truncate-in-place.
+TMP=$(mktemp -p "$(dirname "$LIVE")" .grub.cfg.XXXXXX)
+printf '%s\n' "$DESIRED" > "$TMP"
+chmod 0700 "$TMP" 2>/dev/null || true   # FAT can't represent it; harmless
+mv -f "$TMP" "$LIVE"
+sync -f "$LIVE" 2>/dev/null || sync
+
+log "wrote $LIVE (LUKS=$LUKS_UUID_RAW btrfs=$BTRFS_UUID subvol=$DEFAULT_SUBVOL)"

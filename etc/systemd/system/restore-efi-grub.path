@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch EFI grub.cfg and restore custom version when clobbered
+Documentation=file:/usr/local/bin/restore-efi-grub
+After=local-fs.target
+RequiresMountsFor=/boot/efi
+
+[Path]
+# Watch the *directory*, not the file. inotify-watching a file by name
+# misses some rename-over writes (writer creates a temp, renames over the
+# target — the old inode is gone, watch lost). Watching the parent dir
+# catches any change to anything inside it; the service is idempotent
+# (cmp against rendered desired), so extra no-op firings are harmless.
+PathChanged=/boot/efi/EFI/fedora/
+Unit=restore-efi-grub.service
+
+[Install]
+WantedBy=multi-user.target
